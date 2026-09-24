@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minidbg"
+version = "0.1.0"
+description = "WinDbg-style command line for Windows user-mode minidumps"
+requires-python = ">=3.9"
+
+[project.scripts]
+minidbg = "minidbg.cli:main"
+
+[tool.setuptools]
+packages = ["minidbg", "minidbg.plugins"]
