@@ -34,12 +34,14 @@ minidbg stealer.DMP lm -h           options of one plugin
 | `writemem` | `.writemem` | Save memory to a file | Memory64List / MemoryList |
 | `address` | `!address` | What is every region of the address space? | MemoryInfoList + everything above |
 | `handles` | `!handle` | What files, keys, mutexes were open? | HandleData |
+| `heap` | `!heap` | Which heaps does the process have, and which heap manager runs each? | `PEB.ProcessHeaps` + each heap's header |
 
 ## Where the code lives
 
 | File | Job |
 |---|---|
 | `minidbg/minidump.py` | The parser. Opens the file, reads every stream, builds the memory index, reads virtual memory, parses exports, finds the PEB. No printing. |
+| `minidbg/heap.py` | Heaps: finds them in `PEB.ProcessHeaps` and tells NT heaps from segment heaps by signature. No printing. |
 | `minidbg/constants.py` | Stream numbers, dump flags, protection names, and the fixed offsets for PEB, TEB and CONTEXT. |
 | `minidbg/plugin.py` | The `Plugin` base class and `load_plugins()`, which finds every plugin. |
 | `minidbg/context.py` | `Context`: the chosen thread and its registers, the expression parser, address formatting. |
@@ -47,7 +49,7 @@ minidbg stealer.DMP lm -h           options of one plugin
 | `minidbg/cli.py` | Loads the plugins, builds the command line, opens the dump, runs one plugin. |
 | `~/.local/bin/minidbg` | Two-line launcher, so `minidbg` works from any folder. |
 | `tests/dumpbuilder.py` | Writes small minidumps from scratch, so tests know the right answers. |
-| `tests/test_minidbg.py` | 21 unit tests. |
+| `tests/test_minidbg.py` | 23 unit tests. |
 | `tests/crosscheck_skelsec.py` | Compares minidbg against skelsec's independent `minidump` library on real dumps. |
 
 The flow for every run is the same:
@@ -568,6 +570,7 @@ Each plugin is a class in `minidbg/plugins/`:
 | `writemem.py` | `writemem` |
 | `address.py` | `address` |
 | `handles.py` | `handles` |
+| `heap.py` | `heap` |
 
 This is the whole of `lm.py`'s structure:
 
@@ -988,19 +991,80 @@ minidbg stealer.DMP handles -s                 count per type
 
 Access values are raw bit masks. For example `0x00100020` on a File handle is `SYNCHRONIZE | FILE_TRAVERSE`, typical of the handle a process keeps to its current directory.
 
+## `heap`
+
+```
+minidbg stealer.DMP heap                       WinDbg: !heap
+```
+
+**Shows** every heap the process has: its address, which heap manager runs it, its flags, and which one is the default heap. This is step 1 of phase 2. It lists heaps but does not yet look inside them.
+
+```
+  #  Heap Address       Type           Flags     Class              Flag names
+  0* 00000241`9bda0000  NT Heap        00000002  0 process heap     GROWABLE
+  1  00000241`9bbc0000  NT Heap        00008000  8 CSR port heap
+2 heap(s) in PEB.ProcessHeaps; * = PEB.ProcessHeap (what GetProcessHeap() returns)
+```
+
+**How the heaps are found.** A heap handle, the value `HeapCreate` and `GetProcessHeap` return, is simply the address of the heap's header. The PEB keeps a list of them:
+
+| PEB field | x64 | x86 | Meaning |
+|---|---|---|---|
+| `ProcessHeap` | +0x30 | +0x18 | The default heap (`GetProcessHeap()`); marked `*` |
+| `NumberOfHeaps` | +0xE8 | +0x88 | How many entries the list has |
+| `ProcessHeaps` | +0xF0 | +0x90 | Pointer to an array of heap addresses |
+
+`list_heaps()` in `heap.py` reads the array (with `dump.process_heaps()` from section 2.6), then checks each header with `identify_heap()`.
+
+**Two heap managers.** Windows 10 and 11 have two:
+
+- The **NT heap**, the classic one. Its header is `_HEAP`, which begins with its own first segment (`_HEAP_SEGMENT`).
+- The **segment heap**, newer. Its header is `_SEGMENT_HEAP`. Windows uses it for Store apps and some system processes.
+
+Both headers put a signature dword two pointers in, at the same offset. This is how ntdll itself decides which code handles a heap handle:
+
+| Value at +0x10 (x64) / +0x08 (x86) | Meaning |
+|---|---|
+| `DDEEDDEE` | `_SEGMENT_HEAP.Signature`: a segment heap |
+| `FFEEFFEE` | `_HEAP_SEGMENT.SegmentSignature`: an NT heap *segment* |
+
+`FFEEFFEE` alone is not enough, because every NT heap segment has it, including a heap's extra segments. Only the heap header also has `_HEAP.Signature = EEFFEEFF` at +0x98 (x86: +0x64). minidbg checks both. Anything else is shown as `unrecognised` with the dword it found. If the header was not saved in the dump, the row says `<not captured>`.
+
+**Flags and class.** For NT heaps, `_HEAP.Flags` (+0x70; x86 +0x40) holds the `HEAP_*` flags the heap was created with. Bits 12–15 are the heap *class*, which says who created it:
+
+| Class | Flags | Who creates it |
+|---|---|---|
+| 0 process heap | `00000002` | The loader, at process start: the default heap |
+| 1 private heap | `00001002` | `HeapCreate` (the C runtime and many DLLs do this) |
+| 7 CSR shared heap | `00007008` | csrss.exe itself (seen only there in `memhere.mem`) |
+| 8 CSR port heap | `00008000` | Shared with csrss.exe when the process connects to it. 111 of the 115 processes in `memhere.mem` have one |
+
+`GROWABLE` (0x2) means the heap can add segments when it is full. Heaps made with a maximum size don't have it. Segment heaps store their flags differently, so their row shows `-` for now.
+
+**Where the offsets come from.** They are not guessed. The x64 values match all 8 of Volatility's 64-bit symbol files on this machine (7 kernels and one ntdll; one kernel is old enough to have no segment heap at all), and the x86 `_HEAP` values match the one 32-bit file. That file predates the segment heap, so the x86 `_SEGMENT_HEAP.Signature` offset (+0x08) is derived from the structure (it comes after two pointers), not checked.
+
+**Checked on real data.** A throwaway Volatility plugin read the same dwords for every heap of every process in `memhere.mem` (Windows 10 19041):
+
+- 188 NT heaps, all with both signatures;
+- 227 segment heaps, in svchost, lsass, csrss, services, smss, RuntimeBroker, msedge and others (in 90 processes the *default* heap is a segment heap);
+- 12 heaps whose header was paged out.
+
+All NT heap flags decoded to classes from the table above. Your three minidumps contain only NT heaps. A dump of lsass or svchost would show segment heaps.
+
 ---
 
 # Part 5 — How it was checked, and what is missing
 
 ## Tests
 
-`python3 -m unittest discover -s tests` runs 21 tests against minidumps that `tests/dumpbuilder.py` writes from scratch. Because the builder puts every byte in place, each test knows the exact right answer. They cover:
+`python3 -m unittest discover -s tests` runs 23 tests against minidumps that `tests/dumpbuilder.py` writes from scratch. Because the builder puts every byte in place, each test knows the exact right answer. They cover:
 
 - header and flags; a second module in the list (proves the 108-byte step);
 - Memory64 offsets adding up; reads across two adjacent ranges; reads into a gap (error, padding, `None`);
 - search across a range boundary and inside a limited range;
 - thread registers, start address and name; export-based symbols and reverse lookup;
 - PEB, heaps and command line; region labels; handles, exception, MiscInfo, comments;
+- `heap`: an NT heap, a segment heap, an NT segment that is not a heap header, and a heap that was not captured; the flag and class names; the x86 offsets;
 - a 32-bit dump (pointer size 4, x86 registers, x86 PEB offsets);
 - a bad signature (needs `--force`) and an impossible module count (clipped with a warning);
 - every plugin, run through the real command line, prints what it should;
@@ -1017,6 +1081,6 @@ One difference is expected. skelsec cannot represent combined protections like `
 - **No PDB symbols.** Names come from export tables only (section 2.5).
 - **No disassembler (`u`) and no call stack (`k`).** Use `r` for the raw bytes and `dps @rsp` for the stack.
 - **Registers for x64 and x86 only.** ARM64 dumps parse, but `r` has nothing to show.
-- **Heaps.** `address` recognises only each heap's first segment, and there is no `heap` plugin yet. That is phase 2: walk `PEB.ProcessHeaps` → `_HEAP.SegmentList` → `_HEAP_ENTRY`, decode the encoded entry headers, then add the LFH and large allocations.
+- **Heap contents.** `heap` lists the heaps (step 1 of phase 2) but does not walk them, and `address` recognises only each heap's first segment. Next steps: `_HEAP.SegmentList` → `_HEAP_ENTRY`, decode the encoded entry headers, then the LFH and large allocations, then segment heaps.
 - **Streams listed but not decoded:** Token, SystemMemoryInfo, ProcessVmCounters, IptTrace, FunctionTable, HandleOperationList.
 - **Kernel dumps** (`PAGEDU64`, e.g. `C:\Windows\MEMORY.DMP` and the files in `C:\Windows\Minidump`) are a different format. Use Volatility or WinDbg for those.

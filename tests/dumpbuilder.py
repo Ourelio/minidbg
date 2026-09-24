@@ -85,6 +85,9 @@ def pe_with_exports(size: int, exports: dict[str, int]) -> bytearray:
 TESTMOD = 0x7FF800000000
 APP = 0x140000000
 TEB, PEB, PARAMS, HEAP, UNKNOWN = 0x10000, 0x11000, 0x11400, 0x30000, 0x50000
+SEGMENT_HEAP = 0x40000
+NOT_A_HEAP = HEAP + 0x800      # has an NT *segment* signature but no _HEAP.Signature
+MISSING_HEAP = 0x70000         # listed in PEB.ProcessHeaps, not captured
 STACK_POINTER = 0x20F00
 TID, PID = 0x1234, 0x1000
 COMMAND_LINE = "app.exe --flag CTF{minidump}"
@@ -147,6 +150,7 @@ def build_x64_dump() -> bytes:
         (TEB, TEB, PAGE_READWRITE, 0x2000, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE),
         (0x20000, 0x20000, PAGE_READWRITE, 0x1000, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE),
         (HEAP, HEAP, PAGE_READWRITE, 0x1000, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE),
+        (SEGMENT_HEAP, SEGMENT_HEAP, PAGE_READWRITE, 0x1000, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE),
         (UNKNOWN, UNKNOWN, PAGE_READWRITE, 0x1000, MEM_COMMIT, PAGE_READWRITE, MEM_PRIVATE),
         (0x60000, 0, 0, 0x10000, MEM_FREE, PAGE_NOACCESS, 0),
         (APP, APP, PAGE_EXECUTE_WRITECOPY, 0x1000, MEM_COMMIT, PAGE_READONLY, MEM_IMAGE),
@@ -166,9 +170,10 @@ def build_x64_dump() -> bytes:
     put(teb_peb, peb + 0x10, "<Q", APP)
     put(teb_peb, peb + 0x20, "<Q", PARAMS)
     put(teb_peb, peb + 0x30, "<Q", HEAP)
-    put(teb_peb, peb + 0xE8, "<I", 1)
+    process_heaps = [HEAP, SEGMENT_HEAP, NOT_A_HEAP, MISSING_HEAP]
+    put(teb_peb, peb + 0xE8, "<I", len(process_heaps))
     put(teb_peb, peb + 0xF0, "<Q", 0x11F00)
-    put(teb_peb, 0x1F00, "<Q", HEAP)
+    put(teb_peb, 0x1F00, f"<{len(process_heaps)}Q", *process_heaps)
     params = PARAMS - TEB
     strings = {0x38: (0x11C00, "C:\\app\\"), 0x60: (0x11C40, "C:\\app\\app.exe"), 0x70: (0x11C80, COMMAND_LINE)}
     for field, (va, text) in strings.items():
@@ -183,18 +188,28 @@ def build_x64_dump() -> bytes:
     stack = bytearray(0x1000)
     put(stack, STACK_POINTER - 0x20000, "<Q", TESTMOD + 0x1110)     # return address FuncB+0x10
 
+    heap = bytearray(0x1000)
+    put(heap, 0x10, "<I", 0xFFEEFFEE)                                # _HEAP.SegmentSignature
+    put(heap, 0x70, "<I", 0x2)                                       # _HEAP.Flags = GROWABLE
+    put(heap, 0x98, "<I", 0xEEFFEEFF)                                # _HEAP.Signature
+    put(heap, NOT_A_HEAP - HEAP + 0x10, "<I", 0xFFEEFFEE)
+    segment_heap = bytearray(0x1000)
+    put(segment_heap, 0x10, "<I", 0xDDEEDDEE)                        # _SEGMENT_HEAP.Signature
+
     unknown = bytearray(0x1000)
     unknown[0x123:0x123 + 11] = b"FINDME_1337"
 
     image = pe_with_exports(0x2000, {"FuncA": 0x1000, "FuncB": 0x1100})
     image[0xFFE:0x1002] = b"SPAN"                                    # straddles the two ranges below
 
-    b.memory64([(TEB, bytes(teb_peb)), (0x20000, bytes(stack)), (UNKNOWN, bytes(unknown)),
+    b.memory64([(TEB, bytes(teb_peb)), (0x20000, bytes(stack)), (HEAP, bytes(heap)),
+                (SEGMENT_HEAP, bytes(segment_heap)), (UNKNOWN, bytes(unknown)),
                 (TESTMOD, bytes(image[:0x1000])), (TESTMOD + 0x1000, bytes(image[0x1000:]))])
     return b.build()
 
 
 X86_TEB, X86_PEB, X86_PARAMS = 0x7FFDE000, 0x7FFDF000, 0x7FFDF400
+X86_HEAP = 0x150000
 
 
 def build_x86_dump() -> bytes:
@@ -212,9 +227,17 @@ def build_x86_dump() -> bytes:
     page = bytearray(0x2000)
     put(page, 0x30, "<I", X86_PEB)
     put(page, X86_PEB - X86_TEB + 0x10, "<I", X86_PARAMS)
+    put(page, X86_PEB - X86_TEB + 0x18, "<I", X86_HEAP)              # ProcessHeap
+    put(page, X86_PEB - X86_TEB + 0x88, "<I", 1)                     # NumberOfHeaps
+    put(page, X86_PEB - X86_TEB + 0x90, "<I", X86_PEB + 0x800)       # ProcessHeaps
+    put(page, X86_PEB - X86_TEB + 0x800, "<I", X86_HEAP)
+    heap = bytearray(0x100)
+    put(heap, 0x08, "<I", 0xFFEEFFEE)
+    put(heap, 0x40, "<I", 0x1002)                                    # GROWABLE, class 1 (private)
+    put(heap, 0x64, "<I", 0xEEFFEEFF)
     command_line = "calc.exe /x86"
     unicode_string(page, X86_PARAMS - X86_TEB + 0x40, 0x7FFDFC00, command_line, 4)
     encoded = command_line.encode("utf-16-le")
     page[0x7FFDFC00 - X86_TEB:0x7FFDFC00 - X86_TEB + len(encoded)] = encoded
-    b.memory64([(X86_TEB, bytes(page))])
+    b.memory64([(X86_HEAP, bytes(heap)), (X86_TEB, bytes(page))])
     return b.build(flags=0x2)

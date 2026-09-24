@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import dumpbuilder as B  # noqa: E402
 from minidbg import MemoryNotCaptured, MiniDump, MiniDumpError  # noqa: E402
 from minidbg.cli import main  # noqa: E402
+from minidbg.heap import NT_HEAP, SEGMENT_HEAP, heap_class, heap_flag_names, list_heaps  # noqa: E402
 from minidbg.plugin import load_plugins  # noqa: E402
 
 
@@ -102,7 +103,7 @@ class X64DumpTests(unittest.TestCase):
 
     def test_peb_structures(self):
         self.assertEqual(self.dump.peb_address, B.PEB)
-        self.assertEqual(self.dump.process_heaps(), [B.HEAP])
+        self.assertEqual(self.dump.process_heaps(), [B.HEAP, B.SEGMENT_HEAP, B.NOT_A_HEAP, B.MISSING_HEAP])
         self.assertEqual(self.dump.main_module().path, "C:\\app\\app.exe")
         command_line = self.dump.read_unicode_string(B.PARAMS + self.dump.offsets.upp_command_line)
         self.assertEqual(command_line, B.COMMAND_LINE)
@@ -115,6 +116,21 @@ class X64DumpTests(unittest.TestCase):
         self.assertEqual(usages[B.UNKNOWN][0], "<unknown>")
         self.assertEqual(usages[0x60000][1], {"Free"})
         self.assertEqual(usages[B.TESTMOD][0], "Image  testmod.dll")
+
+    def test_list_heaps(self):
+        heaps = list_heaps(self.dump)
+        self.assertEqual([h.address for h in heaps], [B.HEAP, B.SEGMENT_HEAP, B.NOT_A_HEAP, B.MISSING_HEAP])
+        self.assertEqual([h.kind for h in heaps], [NT_HEAP, SEGMENT_HEAP, None, None])
+        self.assertEqual([h.default for h in heaps], [True, False, False, False])
+        self.assertEqual([h.captured for h in heaps], [True, True, True, False])
+        self.assertEqual(heaps[0].flags, 0x2)
+        self.assertEqual(heaps[2].signature, 0xFFEEFFEE)    # a segment signature alone isn't a heap
+
+    def test_heap_flag_decoding(self):
+        self.assertEqual(heap_class(0x8000), "8 CSR port heap")
+        self.assertEqual((heap_class(0x7008), heap_flag_names(0x7008)), ("7 CSR shared heap", "ZERO_MEMORY"))
+        self.assertEqual(heap_flag_names(0x1002), "GROWABLE")
+        self.assertEqual(heap_flag_names(0x100003), "NO_SERIALIZE | GROWABLE | 0x100000")
 
     def test_misc_system_handles_exception(self):
         self.assertEqual(self.dump.process_id, B.PID)
@@ -157,6 +173,11 @@ class X64DumpTests(unittest.TestCase):
             (["vertarget"], ["Windows 10 Version 10.0.19045", "Integrity level:    High"]),
             (["dumpdebug"], ["MiniDumpWithFullMemory", "Memory64ListStream (9)"]),
             (["process"], ["name: C:\\app\\app.exe"]),
+            (["heap"], ["  0* 00000000`00030000  NT Heap        00000002  0 process heap     GROWABLE",
+                        "  1  00000000`00040000  Segment Heap   -",
+                        "  2  00000000`00030800  unrecognised",  "(signature dword is ffeeffee)",
+                        "  3  00000000`00070000  <not captured>", "4 heap(s) in PEB.ProcessHeaps"]),
+            (["!heap"], ["Segment Heap"]),
             (["teb"], ["ClientId:         1000.1234", "<-- not inside any module"]),
         ]
         for argv, expected in cases:
@@ -243,6 +264,8 @@ class X86DumpTests(unittest.TestCase):
             self.assertIn("PEB at 7ffdf000", out)
             _, out, _ = run_cli(path, "r")
             self.assertIn("eip=00401000", out)
+            _, out, _ = run_cli(path, "heap")
+            self.assertIn("  0* 00150000      NT Heap        00001002  1 private heap     GROWABLE", out)
         finally:
             os.remove(path)
 
